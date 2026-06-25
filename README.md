@@ -14,7 +14,7 @@ everytime you come back on the project :
 .\venv\Scripts\Activate.ps1
 """
 
-Note :
 
+Note :
 Never put the venv in the repo, always in the gitignore.
 To do this, before committing, type "Add-Content .gitignore 'venv/'" in the terminal (only needs to be done once)

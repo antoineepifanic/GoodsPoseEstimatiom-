@@ -1,6 +1,10 @@
 """
 Lectura de distancia central con OAK-D Lite
 Solo profundidad estereo nativa - sin calculos adicionales
+Medicion robusta usando ROI central 21x21:
+- se toman los pixeles validos cerca del centro
+- se seleccionan los mas cercanos
+- se calcula la mediana de ese subconjunto
 Salir: tecla Q
 """
 
@@ -32,6 +36,10 @@ mono_izq.out.link(estereo.left)
 mono_der.out.link(estereo.right)
 estereo.depth.link(salida.input)
 
+# --- Parámetros de medición ---
+ROI_TAM = 30                    # ROI central 30x30
+PORCENTAJE_CERCANOS = 0.30      # usar el 30% de pixeles validos mas cercanos
+
 # --- Bucle principal ---
 
 print("Iniciando OAK-D Lite...")
@@ -59,15 +67,32 @@ with dai.Device(pipeline) as dispositivo:
         h, w = frame_prof.shape
         cx, cy = w // 2, h // 2
 
-        # Lectura en zona 5x5 centrada (mediana para evitar pixel ruidoso)
-        zona = frame_prof[cy-2:cy+3, cx-2:cx+3]
+        # --- ROI central 21x21 ---
+        mitad = ROI_TAM // 2
+        x1 = max(0, cx - mitad)
+        x2 = min(w, cx + mitad + 1)
+        y1 = max(0, cy - mitad)
+        y2 = min(h, cy + mitad + 1)
+
+        zona = frame_prof[y1:y2, x1:x2]
+
+        # Solo pixeles validos
         pixeles_validos = zona[zona > 0]
 
         if pixeles_validos.size > 0:
-            distancia_mm = int(np.median(pixeles_validos))
+            # Ordenar de menor a mayor distancia (los mas cercanos primero)
+            pixeles_ordenados = np.sort(pixeles_validos)
+
+            # Tomar el 30% mas cercano (al menos 1 pixel)
+            n_cercanos = max(1, int(len(pixeles_ordenados) * PORCENTAJE_CERCANOS))
+            pixeles_cercanos = pixeles_ordenados[:n_cercanos]
+
+            # Mediana robusta de los pixeles mas cercanos
+            distancia_mm = int(np.median(pixeles_cercanos))
             distancia_cm = distancia_mm / 10.0
-            texto_dist   = f"Distancia: {distancia_mm} mm  ({distancia_cm:.1f} cm)"
-            color_texto  = (0, 255, 80)
+
+            texto_dist  = f"Distancia: {distancia_mm} mm  ({distancia_cm:.1f} cm)"
+            color_texto = (0, 255, 80)
         else:
             distancia_mm = 0
             texto_dist   = "Sin medida valida"
@@ -80,10 +105,13 @@ with dai.Device(pipeline) as dispositivo:
                                   cv2.NORM_MINMAX, dtype=cv2.CV_8U)
         frame_vis = cv2.applyColorMap(frame_vis, cv2.COLORMAP_INFERNO)
 
-        # Mira central
-        cv2.line(frame_vis, (cx - 20, cy), (cx + 20, cy), (255,255,255), 1)
-        cv2.line(frame_vis, (cx, cy - 20), (cx, cy + 20), (255,255,255), 1)
+        # Cruz central
+        cv2.line(frame_vis, (cx - 20, cy), (cx + 20, cy), (255, 255, 255), 1)
+        cv2.line(frame_vis, (cx, cy - 20), (cx, cy + 20), (255, 255, 255), 1)
         cv2.circle(frame_vis, (cx, cy), 5, (255, 255, 255), 1)
+
+        # Dibujar ROI 21x21
+        cv2.rectangle(frame_vis, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), 1)
 
         # Fondo semitransparente para el texto
         overlay = frame_vis.copy()
