@@ -1,133 +1,204 @@
 """
-Lectura de distancia central con OAK-D Lite
-Solo profundidad estereo nativa - sin calculos adicionales
-Medicion robusta usando ROI central 21x21:
-- se toman los pixeles validos cerca del centro
-- se seleccionan los mas cercanos
-- se calcula la mediana de ese subconjunto
-Salir: tecla Q
+OAK-D Lite — Mesure de distance centrale
+- Fixes précision : subpixel + left-right check
+- Algorithme : médiane des N% pixels les plus proches
+- Double affichage : caméra couleur + carte de profondeur
+- Stabilisation temporelle de la distance
+Quitter : touche Q
 """
 
 import cv2
 import depthai as dai
 import numpy as np
+from collections import deque
 
-# --- Pipeline minimalista ---
+# ─── Pipeline ───────────────────────────────────────────────────────────────
 
 pipeline = dai.Pipeline()
 
-mono_izq = pipeline.create(dai.node.MonoCamera)
-mono_der = pipeline.create(dai.node.MonoCamera)
-estereo  = pipeline.create(dai.node.StereoDepth)
-salida   = pipeline.create(dai.node.XLinkOut)
+mono_izq   = pipeline.create(dai.node.MonoCamera)
+mono_der   = pipeline.create(dai.node.MonoCamera)
+estereo    = pipeline.create(dai.node.StereoDepth)
+color_cam  = pipeline.create(dai.node.ColorCamera)
+xout_prof  = pipeline.create(dai.node.XLinkOut)
+xout_color = pipeline.create(dai.node.XLinkOut)
 
-salida.setStreamName("profundidad")
+xout_prof.setStreamName("profondeur")
+xout_color.setStreamName("couleur")
 
+# Caméras mono stéréo
 mono_izq.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
 mono_der.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
 mono_izq.setCamera("left")
 mono_der.setCamera("right")
 
-# HIGH_DENSITY = mapa mas lleno, menos zonas sin dato
+# Caméra couleur
+color_cam.setPreviewSize(640, 400)
+color_cam.setInterleaved(False)
+color_cam.setFps(15)
+
+# ─── Stéréo depth : configuration corrigée ──────────────────────────────────
+
+# HIGH_DENSITY sigue funcionando pero está deprecado.
+# Si tu versión acepta DEFAULT, puedes cambiarlo luego.
 estereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
+
+# Filtro mediano
 estereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
 
+# FIX 1 — Subpixel
+# En DepthAI v3 se activa así:
+estereo.setSubpixel(True)
+
+# Para mantener el filtro mediano activo, usamos 3 bits y no 5
+estereo.initialConfig.setSubpixelFractionalBits(3)
+
+# FIX 2 — Left-right check
+estereo.setLeftRightCheck(True)
+
+# El threshold LR se configura en initialConfig, NO en estereo
+estereo.initialConfig.setLeftRightCheckThreshold(5)
+
+# (Opcional) threshold de confianza algo más estricto
+# Si ves demasiados ceros, prueba 180 o comenta esta línea
+estereo.initialConfig.setConfidenceThreshold(150)
+
+# Enlaces
 mono_izq.out.link(estereo.left)
 mono_der.out.link(estereo.right)
-estereo.depth.link(salida.input)
+estereo.depth.link(xout_prof.input)
+color_cam.preview.link(xout_color.input)
 
-# --- Parámetros de medición ---
-ROI_TAM = 30                    # ROI central 30x30
-PORCENTAJE_CERCANOS = 0.30      # usar el 30% de pixeles validos mas cercanos
+# ─── Paramètres de mesure ────────────────────────────────────────────────────
 
-# --- Bucle principal ---
+ROI_TAM = 21                   # ROI central 21x21
+PORCENTAJE_CERCANOS = 0.30     # 30% de los píxeles válidos más cercanos
 
-print("Iniciando OAK-D Lite...")
-print("Presione Q para salir\n")
+# Suavizado temporal
+N_HIST = 7                     # mediana de las últimas N medidas
+historial = deque(maxlen=N_HIST)
 
-with dai.Device(pipeline) as dispositivo:
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
-    cola = dispositivo.getOutputQueue(
-        name="profundidad",
-        maxSize=1,          # Solo conserva el frame mas reciente
-        blocking=False      # No bloquea si la cola esta llena
-    )
+def dessiner_bandeau(frame, texte1, texte2, couleur_texte):
+    """Bandeau semi-transparent en haut du frame avec 2 lignes de texte."""
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 75), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    cv2.putText(frame, texte1,
+                (10, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, couleur_texte, 2, cv2.LINE_AA)
+
+    cv2.putText(frame, texte2,
+                (10, 58), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def dessiner_viseur(frame, cx, cy):
+    """Croix centrale identique sur les deux fenêtres."""
+    cv2.line(frame,  (cx - 20, cy), (cx + 20, cy), (255, 255, 255), 1)
+    cv2.line(frame,  (cx, cy - 20), (cx, cy + 20), (255, 255, 255), 1)
+    cv2.circle(frame, (cx, cy), 5, (255, 255, 255), 1)
+
+# ─── Boucle principale ───────────────────────────────────────────────────────
+
+print("Démarrage OAK-D Lite…")
+print("Appuyer sur Q pour quitter\n")
+
+with dai.Device(pipeline) as dispositif:
+
+    cola_prof  = dispositif.getOutputQueue(name="profondeur", maxSize=1, blocking=False)
+    cola_color = dispositif.getOutputQueue(name="couleur",    maxSize=1, blocking=False)
+
+    dernier_frame_color = None
+    texte_dist = "En attente…"
+    texte_info = ""
+    couleur_texte = (200, 200, 200)
 
     while True:
 
-        paquete = cola.tryGet()
+        # ── Lecture caméra couleur ──────────────────────────────────────────
+        paq_color = cola_color.tryGet()
+        if paq_color is not None:
+            dernier_frame_color = paq_color.getCvFrame()
 
-        if paquete is None:
-            # Sin frame disponible todavia, esperar sin bloquear CPU
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            continue
+        # ── Lecture profondeur ──────────────────────────────────────────────
+        paq_prof = cola_prof.tryGet()
 
-        frame_prof = paquete.getFrame()   # uint16, valores en milimetros
-        h, w = frame_prof.shape
-        cx, cy = w // 2, h // 2
+        if paq_prof is not None:
 
-        # --- ROI central 21x21 ---
-        mitad = ROI_TAM // 2
-        x1 = max(0, cx - mitad)
-        x2 = min(w, cx + mitad + 1)
-        y1 = max(0, cy - mitad)
-        y2 = min(h, cy + mitad + 1)
+            frame_prof = paq_prof.getFrame()    # uint16, en mm
+            h, w = frame_prof.shape
+            cx, cy = w // 2, h // 2
 
-        zona = frame_prof[y1:y2, x1:x2]
+            # ROI centrale
+            demi = ROI_TAM // 2
+            x1 = max(0, cx - demi)
+            x2 = min(w, cx + demi + 1)
+            y1 = max(0, cy - demi)
+            y2 = min(h, cy + demi + 1)
 
-        # Solo pixeles validos
-        pixeles_validos = zona[zona > 0]
+            zone = frame_prof[y1:y2, x1:x2]
+            pixels_valides = zone[zone > 0]
 
-        if pixeles_validos.size > 0:
-            # Ordenar de menor a mayor distancia (los mas cercanos primero)
-            pixeles_ordenados = np.sort(pixeles_validos)
+            if pixels_valides.size > 0:
+                # Trier du plus proche au plus loin
+                pixels_tries = np.sort(pixels_valides)
 
-            # Tomar el 30% mas cercano (al menos 1 pixel)
-            n_cercanos = max(1, int(len(pixeles_ordenados) * PORCENTAJE_CERCANOS))
-            pixeles_cercanos = pixeles_ordenados[:n_cercanos]
+                # Garder les N% les plus proches
+                n_proches = max(1, int(len(pixels_tries) * PORCENTAJE_CERCANOS))
+                pixels_proches = pixels_tries[:n_proches]
 
-            # Mediana robusta de los pixeles mas cercanos
-            distancia_mm = int(np.median(pixeles_cercanos))
-            distancia_cm = distancia_mm / 10.0
+                # Mesure brute de cette frame
+                dist_raw_mm = int(np.median(pixels_proches))
 
-            texto_dist  = f"Distancia: {distancia_mm} mm  ({distancia_cm:.1f} cm)"
-            color_texto = (0, 255, 80)
-        else:
-            distancia_mm = 0
-            texto_dist   = "Sin medida valida"
-            color_texto  = (0, 80, 255)
+                # Stabilisation temporelle
+                historial.append(dist_raw_mm)
+                dist_mm = int(np.median(historial))
+                dist_cm = dist_mm / 10.0
 
-        # --- Visualizacion ---
+                # Stats utiles
+                n_valides = int(pixels_valides.size)
+                std_mm = float(np.std(pixels_valides))
+                min_mm = int(np.min(pixels_valides))
+                max_mm = int(np.max(pixels_valides))
 
-        # Normalizar mapa de profundidad a escala de grises
-        frame_vis = cv2.normalize(frame_prof, None, 0, 255,
-                                  cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        frame_vis = cv2.applyColorMap(frame_vis, cv2.COLORMAP_INFERNO)
+                texte_dist = f"Distance : {dist_mm} mm ({dist_cm:.1f} cm)"
+                texte_info = f"raw:{dist_raw_mm}  val:{n_valides}  std:{std_mm:.1f}  min:{min_mm}  max:{max_mm}"
+                couleur_texte = (0, 255, 80)
+            else:
+                texte_dist = "Aucune mesure valide"
+                texte_info = "ROI sans pixels depth valides"
+                couleur_texte = (0, 80, 255)
 
-        # Cruz central
-        cv2.line(frame_vis, (cx - 20, cy), (cx + 20, cy), (255, 255, 255), 1)
-        cv2.line(frame_vis, (cx, cy - 20), (cx, cy + 20), (255, 255, 255), 1)
-        cv2.circle(frame_vis, (cx, cy), 5, (255, 255, 255), 1)
+            # ── Visualisation profondeur ────────────────────────────────────
+            vis_prof = cv2.normalize(frame_prof, None, 0, 255,
+                                     cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+            vis_prof = cv2.applyColorMap(vis_prof, cv2.COLORMAP_INFERNO)
 
-        # Dibujar ROI 21x21
-        cv2.rectangle(frame_vis, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), 1)
+            dessiner_viseur(vis_prof, cx, cy)
+            cv2.rectangle(vis_prof, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), 1)
+            dessiner_bandeau(vis_prof, texte_dist, texte_info, couleur_texte)
 
-        # Fondo semitransparente para el texto
-        overlay = frame_vis.copy()
-        cv2.rectangle(overlay, (0, 0), (w, 50), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.55, frame_vis, 0.45, 0, frame_vis)
+            cv2.imshow("OAK-D Lite — Profondeur", vis_prof)
 
-        cv2.putText(frame_vis, texto_dist,
-                    (10, 33), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.85, color_texto, 2, cv2.LINE_AA)
+            print(f"\r{texte_dist} | {texte_info}            ", end="", flush=True)
 
-        cv2.imshow("OAK-D Lite - Distancia central", frame_vis)
+        # ── Affichage caméra couleur ────────────────────────────────────────
+        if dernier_frame_color is not None:
+            vis_color = dernier_frame_color.copy()
+            hc, wc = vis_color.shape[:2]
+            cxc, cyc = wc // 2, hc // 2
 
-        print(f"\r{texto_dist}          ", end="", flush=True)
+            dessiner_viseur(vis_color, cxc, cyc)
+            dessiner_bandeau(vis_color, texte_dist, texte_info, couleur_texte)
+
+            cv2.imshow("OAK-D Lite — Caméra", vis_color)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
 cv2.destroyAllWindows()
-print("\nCerrado.")
+print("\nFermé.")
