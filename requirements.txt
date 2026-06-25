@@ -1,0 +1,3 @@
+opencv-python==4.13.0.92
+Depthai==2.31.0.0
+numpy==2.2.6
