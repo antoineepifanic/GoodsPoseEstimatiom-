@@ -1,2 +1,3 @@
-opencv-python
-depth-ai
+opencv-python==4.13.0.92
+depth-ai==2.31.0.0
+numpy==2.5.0
