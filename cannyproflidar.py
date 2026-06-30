@@ -13,7 +13,7 @@ import serial
 import threading
 
 # ─── Paramètres LiDAR TF-Luna ────────────────────────────────────────────────
-PORT_LIDAR          = "COM3"
+PORT_LIDAR          = "COM4"
 BAUD_LIDAR          = 115200
 HAUTEUR_CONVOYEUR_CM = 110.0          # Distance caméra → convoyeur vide (cm)
 SIGNAL_MIN          = 100             # Force minimale du signal LiDAR (fiabilité)
@@ -30,7 +30,7 @@ CENTRE_CROP_X = (X_MAX - X_MIN) // 2
 CENTRE_CROP_Y = (Y_MAX - Y_MIN) // 2
 
 AREA_MIN_COLIS = 5000
-RATIO_CM_PX    = 21.0 / 114.0
+RATIO_CM_PX    = (21.0 / 114.0) * 1.02533 # Correction empirique pour compenser la perspective (le dessus du colis est plus proche de la caméra que le sol)
 
 # ─── Thread LiDAR TF-Luna ────────────────────────────────────────────────────
 # Protocole UART TF-Luna : trame de 9 octets
